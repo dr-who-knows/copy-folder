@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+
+{% block title %}Home · SF Copier{% endblock %}
+
+{% block content %}
+<div class="row g-4">
+  {% if error_message %}
+    <div class="col-12">
+      <div class="alert alert-danger" role="alert">
+        {{ error_message }}
+      </div>
+    </div>
+  {% endif %}
+  <div class="col-md-6">
+    <div class="card">
+      <div class="card-header">Copy Report Folder</div>
+      <div class="card-body">
+        <form method="post" action="/copy/report-folder">
+          <div class="mb-3">
+            <label class="form-label">Source report folder</label>
+            <select name="source_folder_id" class="form-select" required>
+              <option value="" disabled selected>Choose...</option>
+              {% for f in report_folders %}
+                <option value="{{ f['Id'] }}">{{ f['Name'] }} ({{ f['DeveloperName'] }})</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Target folder name</label>
+            <input name="target_folder_name" class="form-control" required />
+          </div>
+          <button class="btn btn-primary" type="submit">Copy</button>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-md-6">
+    <div class="card">
+      <div class="card-header">Copy Dashboard (with reports)</div>
+      <div class="card-body">
+        <form method="get" action="/dashboards" class="mb-3">
+          <label class="form-label">Dashboard folder</label>
+          <div class="input-group">
+            <select name="folder_id" class="form-select" required>
+              <option value="" disabled {% if not selected_dashboard_folder_id %}selected{% endif %}>Choose...</option>
+              {% for f in dashboard_folders %}
+                <option value="{{ f['Id'] }}" {% if selected_dashboard_folder_id and selected_dashboard_folder_id==f['Id'] %}selected{% endif %}>{{ f['Name'] }} ({{ f['DeveloperName'] }})</option>
+              {% endfor %}
+            </select>
+            <button class="btn btn-outline-secondary" type="submit">Load</button>
+          </div>
+        </form>
+
+        <form method="post" action="/copy/dashboard">
+          <div class="mb-3">
+            <label class="form-label">Dashboard</label>
+            <select name="dashboard_developer_name" class="form-select" required>
+              <option value="" disabled selected>Choose...</option>
+              {% for d in dashboards %}
+                <option value="{{ d['DeveloperName'] }}">{{ d['Title'] }} ({{ d['DeveloperName'] }})</option>
+              {% endfor %}
+            </select>
+            {% if selected_dashboard_folder_id %}
+              <input type="hidden" name="dashboard_folder_id" value="{{ selected_dashboard_folder_id }}" />
+            {% endif %}
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Target folder name</label>
+            <input name="target_folder_name" class="form-control" required />
+          </div>
+          <button class="btn btn-primary" type="submit" {% if not selected_dashboard_folder_id %}disabled{% endif %}>Copy</button>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+
