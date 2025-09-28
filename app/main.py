@@ -12,6 +12,10 @@ from .sf import (
     list_dashboards_in_folder,
     copy_report_folder,
     copy_dashboard_with_reports,
+    prepare_report_copy,
+    prepare_dashboard_copy,
+    start_deploy,
+    get_deploy_status,
 )
 
 
@@ -84,5 +88,70 @@ def post_copy_dashboard(
         target_folder_name=target_folder_name,
     )
     return RedirectResponse(url="/", status_code=303)
+
+
+# New prepare endpoints
+@app.post("/prepare/report-folder")
+def prepare_report_folder(request: Request, source_folder_id: str = Form(...), target_folder_name: str = Form(...)):
+    data = prepare_report_copy(source_folder_id=source_folder_id, target_folder_name=target_folder_name)
+    report_folders = list_report_folders()
+    dashboard_folders = list_dashboard_folders()
+    return templates.TemplateResponse(
+        "review.html",
+        {
+            "request": request,
+            "kind": "report",
+            "members": data.get("members", []),
+            "package_xml": data.get("package_xml", ""),
+            "zip_path": data.get("zip_path", ""),
+            "target_folder_devname": data.get("target_folder_devname", ""),
+            "report_folders": report_folders,
+            "dashboard_folders": dashboard_folders,
+        },
+    )
+
+
+@app.post("/prepare/dashboard")
+def prepare_dashboard(request: Request,
+    dashboard_folder_id: str = Form(...),
+    dashboard_developer_name: str = Form(...),
+    target_folder_name: str = Form(...),
+):
+    data = prepare_dashboard_copy(
+        source_dashboard_folder_id=dashboard_folder_id,
+        source_dashboard_developer_name=dashboard_developer_name,
+        target_folder_name=target_folder_name,
+    )
+    report_folders = list_report_folders()
+    dashboard_folders = list_dashboard_folders()
+    return templates.TemplateResponse(
+        "review.html",
+        {
+            "request": request,
+            "kind": "dashboard",
+            "members_reports": data.get("members_reports", []),
+            "member_dashboard": data.get("member_dashboard", ""),
+            "package_xml": data.get("package_xml", ""),
+            "zip_path": data.get("zip_path", ""),
+            "target_folder_devname": data.get("target_folder_devname", ""),
+            "report_folders": report_folders,
+            "dashboard_folders": dashboard_folders,
+        },
+    )
+
+
+# Deploy endpoints
+@app.post("/deploy/start")
+def deploy_start(request: Request, zip_path: str = Form(...)):
+    job_id = start_deploy(zip_path)
+    return templates.TemplateResponse(
+        "deploy_progress.html",
+        {"request": request, "job_id": job_id},
+    )
+
+
+@app.get("/deploy/status")
+def deploy_status(job_id: str):
+    return get_deploy_status(job_id)
 
 

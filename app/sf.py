@@ -1,5 +1,6 @@
 import os
 import logging
+import uuid
 import tempfile
 import zipfile
 from io import BytesIO
@@ -15,6 +16,7 @@ from salesforce_api.models.shared import Type as SfType
 logger = logging.getLogger(__name__)
 
 _SF_CLIENT: Salesforce | None = None
+_DEPLOY_JOBS: Dict[str, object] = {}
 
 
 def get_salesforce_client() -> Salesforce:
@@ -274,6 +276,68 @@ def copy_report_folder(source_folder_id: str, target_folder_name: str) -> None:
     _deploy_zip(new_zip_bytes)
 
 
+def prepare_report_copy(source_folder_id: str, target_folder_name: str) -> Dict[str, object]:
+    """Build deployable zip for copying a report folder, but do not deploy.
+
+    Returns dictionary with: members (List[str]), package_xml (str), zip_path (str), target_folder_devname (str)
+    """
+    sf = get_salesforce_client()
+
+    src_folder_devname, src_folder_name = _get_folder_devname_by_id(source_folder_id)
+    tgt_folder_devname = _ensure_report_folder_exists(target_folder_name)
+
+    logger.info(
+        "Preparing package for Report folder copy: source_devname='%s' -> target_name='%s' (target_devname='%s')",
+        src_folder_devname,
+        target_folder_name,
+        tgt_folder_devname,
+    )
+    items = _list_reports_in_folder_via_soql(src_folder_name)
+    logger.info("Listed reports via SOQL in folder '%s': %d", src_folder_name, len(items))
+    if not items:
+        return {"members": [], "package_xml": "", "zip_path": "", "target_folder_devname": tgt_folder_devname}
+    fullnames = [f"{src_folder_devname}/" + it.get("DeveloperName", "") for it in items if it.get("DeveloperName")]
+    fullnames = list(dict.fromkeys(fullnames))
+    retrieve_types = [SfType("Report", fullnames)]
+    retr = sf.retrieve.retrieve(retrieve_types)
+    logger.info("Waiting for reports retrieve job (prepare)...")
+    retr.wait()
+    source_zip = retr.get_zip_file()
+    raw_zip = source_zip.getvalue()
+
+    tgt_folder_id = _get_folder_id_by_devname("Report", tgt_folder_devname)
+    existing_items = _list_folder_items(tgt_folder_id, "Report")
+    existing: Set[str] = {row.get("developerName", "") for row in existing_items if row.get("developerName")}
+    new_zip_bytes = _repack_reports_zip(BytesIO(raw_zip), src_folder_devname, tgt_folder_devname, existing, force_rename=True)
+
+    # Inspect prepared zip: members and package.xml
+    members: List[str] = []
+    package_xml = ""
+    with zipfile.ZipFile(new_zip_bytes, "r") as zf:
+        for n in zf.namelist():
+            if n.startswith(f"reports/{tgt_folder_devname}/") and n.endswith(".report"):
+                dev = n.split("/")[-1].removesuffix(".report")
+                members.append(f"{tgt_folder_devname}/{dev}")
+        try:
+            package_xml = zf.read("package.xml").decode("utf-8", errors="replace")
+        except Exception:
+            package_xml = ""
+
+    # Persist zip to temp file
+    new_zip_bytes.seek(0)
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+        tmp.write(new_zip_bytes.read())
+        tmp.flush()
+        zip_path = tmp.name
+    logger.info("Prepared zip stored at %s with %d member(s)", zip_path, len(members))
+    return {
+        "members": members,
+        "package_xml": package_xml,
+        "zip_path": zip_path,
+        "target_folder_devname": tgt_folder_devname,
+    }
+
+
 def _resolve_report_developernames(report_ids: List[str]) -> Dict[str, str]:
     """Resolve Report.Id -> Report.DeveloperName via SOQL in batches.
 
@@ -377,6 +441,190 @@ def copy_dashboard_with_reports(
         dashboard_existing,
     )
     _deploy_zip(deploy_zip)
+
+
+def prepare_dashboard_copy(
+    source_dashboard_folder_id: str,
+    source_dashboard_developer_name: str,
+    target_folder_name: str,
+) -> Dict[str, object]:
+    """Build deployable zip for copying a dashboard (and its reports), but do not deploy.
+
+    Returns dictionary with: members_reports (List[str]), member_dashboard (str), package_xml (str), zip_path (str), target_folder_devname (str)
+    """
+    sf = get_salesforce_client()
+
+    src_folder_devname, _ = _get_folder_devname_by_id(source_dashboard_folder_id)
+    tgt_folder_devname = _ensure_dashboard_folder_exists(target_folder_name)
+    _ensure_report_folder_exists(target_folder_name)
+
+    dashboard_fullname = f"{src_folder_devname}/{source_dashboard_developer_name}"
+    logger.info(
+        "Preparing package for Dashboard '%s' to target folder '%s' (devname='%s')",
+        dashboard_fullname,
+        target_folder_name,
+        tgt_folder_devname,
+    )
+    retr = sf.retrieve.retrieve([SfType("Dashboard", [dashboard_fullname])])
+    retr.wait()
+    dash_zip = retr.get_zip_file()
+
+    dash_xml_path = f"dashboards/{src_folder_devname}/{source_dashboard_developer_name}.dashboard"
+    with zipfile.ZipFile(dash_zip, "r") as zf:
+        xml_bytes = zf.read(dash_xml_path)
+    referenced_reports = _extract_report_fullnames_from_dashboard_xml(xml_bytes.decode("utf-8"))
+
+    if referenced_reports:
+        retr2 = sf.retrieve.retrieve([SfType("Report", referenced_reports)])
+        retr2.wait()
+        reports_zip = retr2.get_zip_file()
+    else:
+        reports_zip = BytesIO()
+        with zipfile.ZipFile(reports_zip, "w"):
+            pass
+        reports_zip.seek(0)
+
+    tgt_report_folder_id = _get_folder_id_by_devname("Report", tgt_folder_devname)
+    existing_reports_items = _list_folder_items(tgt_report_folder_id, "Report")
+    report_existing: Set[str] = {r.get("developerName", "") for r in existing_reports_items if r.get("developerName")}
+
+    tgt_dash_folder_id = _get_folder_id_by_devname("Dashboard", tgt_folder_devname)
+    existing_dash_items = _list_folder_items(tgt_dash_folder_id, "Dashboard")
+    dashboard_existing: Set[str] = {d.get("developerName", "") for d in existing_dash_items if d.get("developerName")}
+
+    deploy_zip = _repack_dashboard_and_reports_zip(
+        dash_zip,
+        reports_zip,
+        src_folder_devname,
+        tgt_folder_devname,
+        source_dashboard_developer_name,
+        report_existing,
+        dashboard_existing,
+    )
+
+    members_reports: List[str] = []
+    member_dashboard: str = ""
+    package_xml = ""
+    with zipfile.ZipFile(deploy_zip, "r") as zf:
+        for n in zf.namelist():
+            if n.startswith(f"reports/{tgt_folder_devname}/") and n.endswith(".report"):
+                dev = n.split("/")[-1].removesuffix(".report")
+                members_reports.append(f"{tgt_folder_devname}/{dev}")
+            if n.startswith(f"dashboards/{tgt_folder_devname}/") and n.endswith(".dashboard"):
+                dev = n.split("/")[-1].removesuffix(".dashboard")
+                member_dashboard = f"{tgt_folder_devname}/{dev}"
+        try:
+            package_xml = zf.read("package.xml").decode("utf-8", errors="replace")
+        except Exception:
+            package_xml = ""
+
+    deploy_zip.seek(0)
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+        tmp.write(deploy_zip.read())
+        tmp.flush()
+        zip_path = tmp.name
+    logger.info(
+        "Prepared dashboard zip stored at %s with %d report(s) and dashboard '%s'",
+        zip_path,
+        len(members_reports),
+        member_dashboard,
+    )
+    return {
+        "members_reports": members_reports,
+        "member_dashboard": member_dashboard,
+        "package_xml": package_xml,
+        "zip_path": zip_path,
+        "target_folder_devname": tgt_folder_devname,
+    }
+
+
+def start_deploy(zip_path: str) -> str:
+    sf = get_salesforce_client()
+    from salesforce_api.models.deploy import Options
+    job_id = str(uuid.uuid4())
+    logger.info("Starting deployment job %s for zip %s", job_id, zip_path)
+    deployment = sf.deploy.deploy(zip_path, Options(checkOnly=False))
+    _DEPLOY_JOBS[job_id] = deployment
+    return job_id
+
+
+def get_deploy_status(job_id: str) -> Dict[str, object]:
+    deployment = _DEPLOY_JOBS.get(job_id)
+    if deployment is None:
+        return {"error": "job_not_found", "job_id": job_id}
+    status = deployment.get_status()
+    # Serialize common fields if present
+    out: Dict[str, object] = {"job_id": job_id}
+    for key in ["id", "status", "done", "success"]:
+        try:
+            out[key] = getattr(status, key)
+        except Exception:
+            pass
+
+    # Components progress (library exposes DeployDetails at status.components)
+    try:
+        comp = getattr(status, "components", None)
+        if comp is not None:
+            total = getattr(comp, "total_count", None)
+            completed = getattr(comp, "completed_count", None)
+            failed = getattr(comp, "failed_count", None)
+            out["numberComponentsTotal"] = total
+            out["numberComponentsDeployed"] = completed
+            out["numberComponentErrors"] = failed
+            out["componentsProgressPercent"] = (completed * 100 // total) if total else 0
+            # Include component failures if any
+            try:
+                failures = getattr(comp, "failures", []) or []
+                out["componentFailures"] = [
+                    {
+                        "component_type": getattr(f, "component_type", None),
+                        "file": getattr(f, "file", None),
+                        "status": getattr(f, "status", None),
+                        "message": getattr(f, "message", None),
+                    }
+                    for f in failures
+                ]
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Tests progress (library exposes DeployDetails at status.tests)
+    try:
+        tests = getattr(status, "tests", None)
+        if tests is not None:
+            t_total = getattr(tests, "total_count", None)
+            t_completed = getattr(tests, "completed_count", None)
+            t_failed = getattr(tests, "failed_count", None)
+            out["numberTestsTotal"] = t_total
+            out["numberTestsCompleted"] = t_completed
+            out["numberTestErrors"] = t_failed
+            out["testsProgressPercent"] = (t_completed * 100 // t_total) if t_total else 0
+            # Include test failures if any
+            try:
+                t_failures = getattr(tests, "failures", []) or []
+                out["testFailures"] = [
+                    {
+                        "class_name": getattr(f, "class_name", None),
+                        "method": getattr(f, "method", None),
+                        "message": getattr(f, "message", None),
+                        "stack_trace": getattr(f, "stack_trace", None),
+                    }
+                    for f in t_failures
+                ]
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Failures summary if available
+    try:
+        details = getattr(status, "details", None)
+        if details:
+            out["details"] = str(details)
+    except Exception:
+        pass
+    return out
 
 
 def _repack_reports_zip(

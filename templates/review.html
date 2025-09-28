@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+
+{% block title %}Review Package · SF Copier{% endblock %}
+
+{% block content %}
+<div class="row g-4">
+  <div class="col-12">
+    <div class="card">
+      <div class="card-header">Review package before deploy</div>
+      <div class="card-body">
+        {% if kind == 'report' %}
+          <p><strong>Target folder</strong>: {{ target_folder_devname }}</p>
+          <p><strong>Members (Reports)</strong> ({{ members|length }}):</p>
+          <ul>
+            {% for m in members %}
+              <li>{{ m }}</li>
+            {% endfor %}
+          </ul>
+        {% else %}
+          <p><strong>Target folder</strong>: {{ target_folder_devname }}</p>
+          <p><strong>Dashboard</strong>: {{ member_dashboard }}</p>
+          <p><strong>Reports</strong> ({{ members_reports|length }}):</p>
+          <ul>
+            {% for m in members_reports %}
+              <li>{{ m }}</li>
+            {% endfor %}
+          </ul>
+        {% endif %}
+
+        <div class="mb-3">
+          <label class="form-label">package.xml</label>
+          <textarea class="form-control" rows="10" readonly>{{ package_xml }}</textarea>
+        </div>
+
+        <form method="post" action="/deploy/start" class="d-inline">
+          <input type="hidden" name="zip_path" value="{{ zip_path }}" />
+          <button class="btn btn-primary" type="submit" {% if not zip_path or (kind == 'report' and members|length == 0) or (kind != 'report' and (not member_dashboard and members_reports|length == 0)) %}disabled{% endif %}>Deploy</button>
+        </form>
+        <a class="btn btn-secondary" href="/">Cancel</a>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+

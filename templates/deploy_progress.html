@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+
+{% block title %}Deployment Progress · SF Copier{% endblock %}
+
+{% block content %}
+<div class="row g-4">
+  <div class="col-12">
+    <div class="card">
+      <div class="card-header">Deployment Progress</div>
+      <div class="card-body">
+        <p><strong>Job ID:</strong> <code id="jobId">{{ job_id }}</code></p>
+        <div id="statusBox" class="mb-3">
+          <div>Status: <span id="status">Loading...</span></div>
+          <div>Done: <span id="done">-</span></div>
+          <div>Success: <span id="success">-</span></div>
+          <div>Components: <span id="comp">-</span> <span id="compPct" class="text-muted"></span></div>
+          <div>Tests: <span id="tests">-</span> <span id="testsPct" class="text-muted"></span></div>
+          <pre id="details" class="mt-3" style="white-space: pre-wrap"></pre>
+        </div>
+        <a class="btn btn-secondary" href="/">Back</a>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  const jobId = document.getElementById('jobId').textContent;
+  async function poll() {
+    try {
+      const res = await fetch(`/deploy/status?job_id=${encodeURIComponent(jobId)}`);
+      const data = await res.json();
+      document.getElementById('status').textContent = data.status ?? '-';
+      document.getElementById('done').textContent = String(data.done ?? '-');
+      document.getElementById('success').textContent = String(data.success ?? '-');
+      const comp = `${data.numberComponentsDeployed ?? 0}/${data.numberComponentsTotal ?? 0} (errors: ${data.numberComponentErrors ?? 0})`;
+      document.getElementById('comp').textContent = comp;
+      const compPct = (data.componentsProgressPercent ?? 0);
+      document.getElementById('compPct').textContent = compPct ? `(${compPct}%)` : '';
+      const tests = `${data.numberTestsCompleted ?? 0}/${data.numberTestsTotal ?? 0} (errors: ${data.numberTestErrors ?? 0})`;
+      document.getElementById('tests').textContent = tests;
+      const testsPct = (data.testsProgressPercent ?? 0);
+      document.getElementById('testsPct').textContent = testsPct ? `(${testsPct}%)` : '';
+      if (data.details) {
+        document.getElementById('details').textContent = String(data.details);
+      }
+      // stop polling if done
+      if (data.done === true || (typeof data.status === 'string' && ['succeeded','failed','canceled','completed'].includes(data.status.toLowerCase()))) {
+        return;
+      }
+    } catch (e) {
+      console.error(e);
+    }
+    setTimeout(poll, 2000);
+  }
+  poll();
+  </script>
+{% endblock %}
+
+
