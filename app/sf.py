@@ -1,4 +1,5 @@
 import os
+import logging
 import tempfile
 import zipfile
 from io import BytesIO
@@ -10,6 +11,8 @@ from dotenv import load_dotenv
 from salesforce_api import Salesforce
 from salesforce_api.models.shared import Type as SfType
 
+
+logger = logging.getLogger(__name__)
 
 _SF_CLIENT: Salesforce | None = None
 
@@ -43,6 +46,12 @@ def get_salesforce_client() -> Salesforce:
     if api_version:
         client_kwargs["api_version"] = api_version
 
+    logger.debug(
+        "Initializing Salesforce client (domain=%s, is_sandbox=%s, api_version=%s)",
+        client_kwargs.get("domain"),
+        client_kwargs.get("is_sandbox"),
+        client_kwargs.get("api_version"),
+    )
     _SF_CLIENT = Salesforce(**client_kwargs)
     return _SF_CLIENT
 
@@ -72,11 +81,18 @@ def _get_folder_devname_by_id(folder_id: str) -> Tuple[str, str]:
     if not res:
         raise RuntimeError("Folder not found")
     row = res[0]
+    logger.info(
+        "Resolved Folder by Id '%s' to DeveloperName='%s', Name='%s'",
+        folder_id,
+        row["DeveloperName"],
+        row["Name"],
+    )
     return row["DeveloperName"], row["Name"]
 
 
 def _ensure_report_folder_exists(target_folder_name: str) -> str:
     sf = get_salesforce_client()
+    logger.info("Ensuring Report folder exists: Name='%s'", target_folder_name)
     # Try to find by Name; if not exist, create Folder record
     soql = (
         "SELECT Id, Name, DeveloperName FROM Folder WHERE Type = 'Report' "
@@ -84,7 +100,9 @@ def _ensure_report_folder_exists(target_folder_name: str) -> str:
     )
     res = sf.sobjects.query(soql)
     if res:
-        return res[0]["DeveloperName"]
+        dev = res[0]["DeveloperName"]
+        logger.info("Found existing Report folder: DeveloperName='%s'", dev)
+        return dev
 
     # Deduplicate DeveloperName across all report folders in org
     existing_devnames_res = sf.sobjects.query(
@@ -102,19 +120,27 @@ def _ensure_report_folder_exists(target_folder_name: str) -> str:
         "Type": "Report",
         "AccessType": "Public",
     }
+    logger.info(
+        "Creating Report folder: Name='%s', DeveloperName='%s'",
+        target_folder_name,
+        unique_devname,
+    )
     sf.sobjects.Folder.insert(create_body)
     return unique_devname
 
 
 def _ensure_dashboard_folder_exists(target_folder_name: str) -> str:
     sf = get_salesforce_client()
+    logger.info("Ensuring Dashboard folder exists: Name='%s'", target_folder_name)
     soql = (
         "SELECT Id, Name, DeveloperName FROM Folder WHERE Type = 'Dashboard' "
         f"AND Name = '{target_folder_name}'"
     )
     res = sf.sobjects.query(soql)
     if res:
-        return res[0]["DeveloperName"]
+        dev = res[0]["DeveloperName"]
+        logger.info("Found existing Dashboard folder: DeveloperName='%s'", dev)
+        return dev
 
     existing_devnames_res = sf.sobjects.query(
         "SELECT DeveloperName FROM Folder WHERE Type = 'Dashboard'"
@@ -131,6 +157,11 @@ def _ensure_dashboard_folder_exists(target_folder_name: str) -> str:
         "Type": "Dashboard",
         "AccessType": "Public",
     }
+    logger.info(
+        "Creating Dashboard folder: Name='%s', DeveloperName='%s'",
+        target_folder_name,
+        unique_devname,
+    )
     sf.sobjects.Folder.insert(create_body)
     return unique_devname
 
@@ -150,6 +181,23 @@ def _get_folder_id_by_devname(folder_type: str, folder_devname: str) -> str:
     return res[0]["Id"]
 
 
+def _list_reports_in_folder_via_soql(folder_name: str) -> List[Dict[str, str]]:
+    """List reports by Folder Name using SOQL to avoid Analytics 'recent' pollution.
+
+    Returns items with keys: Id, Name, DeveloperName.
+    """
+    sf = get_salesforce_client()
+    # Query Report by FolderName to avoid relationship/field differences across API versions
+    safe_name = folder_name.replace("'", "\\'")
+    soql = (
+        "SELECT Id, Name, DeveloperName FROM Report WHERE FolderName = '"
+        + safe_name
+        + "' ORDER BY Name"
+    )
+    rows = sf.sobjects.query(soql) or []
+    return rows
+
+
 def _dedupe_developer_name(base: str, existing: Set[str]) -> str:
     if base not in existing:
         existing.add(base)
@@ -164,30 +212,98 @@ def _dedupe_developer_name(base: str, existing: Set[str]) -> str:
     return candidate
 
 
+def _force_new_developer_name(base: str, existing: Set[str]) -> str:
+    """Always return a different name than base, updating existing set."""
+    suffix = "_copy"
+    n = 1
+    candidate = f"{base}{suffix}"
+    while candidate in existing or candidate == base:
+        n += 1
+        candidate = f"{base}{suffix}_{n}"
+    existing.add(candidate)
+    return candidate
+
+
 def copy_report_folder(source_folder_id: str, target_folder_name: str) -> None:
     sf = get_salesforce_client()
 
-    src_folder_devname, _ = _get_folder_devname_by_id(source_folder_id)
+    src_folder_devname, src_folder_name = _get_folder_devname_by_id(source_folder_id)
     tgt_folder_devname = _ensure_report_folder_exists(target_folder_name)
 
     # Determine reports within the source folder via Analytics REST, then retrieve exactly those
-    items = _list_folder_items(source_folder_id, "Report")
+    logger.info(
+        "Starting copy of Report folder: source_devname='%s' -> target_name='%s' (target_devname='%s')",
+        src_folder_devname,
+        target_folder_name,
+        tgt_folder_devname,
+    )
+    # Prefer SOQL listing by FolderName to avoid Analytics API returning recent reports
+    items = _list_reports_in_folder_via_soql(src_folder_name)
+    logger.info("Listed reports via SOQL in folder '%s': %d", src_folder_name, len(items))
     if not items:
+        logger.warning(
+            "Source report folder '%s' has no items; nothing to copy.",
+            src_folder_devname,
+        )
         return
-    fullnames = [f"{src_folder_devname}/" + it.get("developerName", "") for it in items if it.get("developerName")]
+    # Build fullnames from DeveloperName
+    fullnames = [f"{src_folder_devname}/" + it.get("DeveloperName", "") for it in items if it.get("DeveloperName")]
+    # Deduplicate while preserving order
+    fullnames = list(dict.fromkeys(fullnames))
+    logger.info("Reports to retrieve (%d): %s", len(fullnames), ", ".join(fullnames) if fullnames else "<none>")
     retrieve_types = [SfType("Report", fullnames)]
     retr = sf.retrieve.retrieve(retrieve_types)
+    logger.info("Waiting for reports retrieve job...")
     retr.wait()
     source_zip = retr.get_zip_file()  # BytesIO
+    try:
+        raw_zip = source_zip.getvalue()
+        with zipfile.ZipFile(BytesIO(raw_zip), "r") as zsrc:
+            logger.info("Retrieved zip entries: %s", ", ".join(zsrc.namelist()))
+    except Exception as exc:
+        logger.debug("Could not inspect retrieved zip: %s", exc)
+        raw_zip = source_zip.getvalue()
 
     # Build new zip with files moved to target folder (dedupe collisions) and package.xml regenerated
     tgt_folder_id = _get_folder_id_by_devname("Report", tgt_folder_devname)
     existing_items = _list_folder_items(tgt_folder_id, "Report")
     existing: Set[str] = {row.get("developerName", "") for row in existing_items if row.get("developerName")}
     new_zip_bytes = _repack_reports_zip(
-        source_zip, src_folder_devname, tgt_folder_devname, existing
+        BytesIO(raw_zip), src_folder_devname, tgt_folder_devname, existing, force_rename=True
     )
     _deploy_zip(new_zip_bytes)
+
+
+def _resolve_report_developernames(report_ids: List[str]) -> Dict[str, str]:
+    """Resolve Report.Id -> Report.DeveloperName via SOQL in batches.
+
+    Uses chunking to respect SOQL limits. Returns mapping of Id to DeveloperName.
+    """
+    sf = get_salesforce_client()
+    mapping: Dict[str, str] = {}
+    if not report_ids:
+        return mapping
+    chunk_size = 200
+    for i in range(0, len(report_ids), chunk_size):
+        chunk = [rid for rid in report_ids[i:i + chunk_size] if rid]
+        if not chunk:
+            continue
+        ids_clause = ",".join(f"'{rid}'" for rid in chunk)
+        soql = f"SELECT Id, DeveloperName FROM Report WHERE Id IN ({ids_clause})"
+        try:
+            res = sf.sobjects.query(soql)
+            for row in res or []:
+                rid = row.get("Id")
+                dev = row.get("DeveloperName")
+                if rid and dev:
+                    mapping[rid] = dev
+        except Exception as exc:
+            logger.warning(
+                "Failed to resolve DeveloperName for %d report ids: %s",
+                len(chunk), exc,
+            )
+    logger.info("Resolved DeveloperName for %d/%d reports", len(mapping), len(report_ids))
+    return mapping
 
 
 def copy_dashboard_with_reports(
@@ -203,9 +319,16 @@ def copy_dashboard_with_reports(
     _ensure_report_folder_exists(target_folder_name)
 
     dashboard_fullname = f"{src_folder_devname}/{source_dashboard_developer_name}"
+    logger.info(
+        "Starting copy of Dashboard '%s' to target folder '%s' (devname='%s')",
+        dashboard_fullname,
+        target_folder_name,
+        tgt_folder_devname,
+    )
 
     # Retrieve dashboard first
     retr = sf.retrieve.retrieve([SfType("Dashboard", [dashboard_fullname])])
+    logger.info("Waiting for dashboard retrieve job...")
     retr.wait()
     dash_zip = retr.get_zip_file()
 
@@ -216,10 +339,16 @@ def copy_dashboard_with_reports(
     referenced_reports = _extract_report_fullnames_from_dashboard_xml(
         xml_bytes.decode("utf-8")
     )
+    logger.info(
+        "Referenced reports in dashboard (%d): %s",
+        len(referenced_reports),
+        ", ".join(referenced_reports) if referenced_reports else "<none>",
+    )
 
     # Retrieve all referenced reports
     if referenced_reports:
         retr2 = sf.retrieve.retrieve([SfType("Report", referenced_reports)])
+        logger.info("Waiting for referenced reports retrieve job...")
         retr2.wait()
         reports_zip = retr2.get_zip_file()
     else:
@@ -255,19 +384,25 @@ def _repack_reports_zip(
     src_folder: str,
     tgt_folder: str,
     existing_devnames: Set[str],
+    force_rename: bool = False,
 ) -> BytesIO:
     src = zipfile.ZipFile(source_zip, "r")
     out_bytes = BytesIO()
     with zipfile.ZipFile(out_bytes, "w", zipfile.ZIP_DEFLATED) as out:
         new_fullnames: List[str] = []
         for name in src.namelist():
-            if not name.startswith(f"reports/{src_folder}/") or not name.endswith(".report"):
+            # Include all reports from the retrieved zip, regardless of original folder
+            if not name.startswith("reports/") or not name.endswith(".report"):
                 # skip non-report files from retrieve (e.g., original package.xml)
                 continue
             content = src.read(name)
-            # derive developer name and dedupe
+            # derive developer name
             base_devname = name.split("/")[-1].removesuffix(".report")
-            new_devname = _dedupe_developer_name(base_devname, existing_devnames)
+            # If force_rename, ensure a different name so deploy copies instead of moves
+            if force_rename:
+                new_devname = _force_new_developer_name(base_devname, existing_devnames)
+            else:
+                new_devname = _dedupe_developer_name(base_devname, existing_devnames)
             new_name = f"reports/{tgt_folder}/{new_devname}.report"
             out.writestr(new_name, content)
             new_fullnames.append(f"{tgt_folder}/{new_devname}")
@@ -275,6 +410,13 @@ def _repack_reports_zip(
         # package.xml
         pkg = _render_package_xml({"Report": new_fullnames})
         out.writestr("package.xml", pkg)
+
+    logger.info(
+        "Prepared deploy package for Reports: %d members -> %s",
+        len(new_fullnames),
+        ", ".join(new_fullnames) if new_fullnames else "<none>",
+    )
+    logger.info("package.xml contents (Reports):\n%s", pkg)
 
     out_bytes.seek(0)
     return out_bytes
@@ -299,7 +441,8 @@ def _repack_dashboard_and_reports_zip(
 
         # write reports moved
         for name in rep_src.namelist():
-            if not name.startswith(f"reports/{src_folder}/") or not name.endswith(".report"):
+            # Include all reports returned in retrieve; they may come from various source folders
+            if not name.startswith("reports/") or not name.endswith(".report"):
                 continue
             content = rep_src.read(name)
             base_devname = name.split("/")[-1].removesuffix(".report")
@@ -307,14 +450,19 @@ def _repack_dashboard_and_reports_zip(
             new_name = f"reports/{tgt_folder}/{new_devname}.report"
             out.writestr(new_name, content)
             report_fullnames.append(f"{tgt_folder}/{new_devname}")
-            rename_map[f"{src_folder}/{base_devname}"] = f"{tgt_folder}/{new_devname}"
+            # Build rename map for any possible original folder
+            try:
+                _, original_folder, _ = name.split("/", 2)
+            except ValueError:
+                original_folder = src_folder
+            rename_map[f"{original_folder}/{base_devname}"] = f"{tgt_folder}/{new_devname}"
 
         # dashboard rewritten
         old_dash_path = f"dashboards/{src_folder}/{dashboard_devname}.dashboard"
         xml_s = dash_src.read(old_dash_path).decode("utf-8")
         new_xml_s = _rewrite_dashboard_report_refs(xml_s, rename_map)
-        # dedupe dashboard name if collisions
-        new_dash_devname = _dedupe_developer_name(dashboard_devname, dashboard_existing)
+        # Always force rename dashboard to ensure copy-not-move semantics
+        new_dash_devname = _force_new_developer_name(dashboard_devname, dashboard_existing)
         new_dash_path = f"dashboards/{tgt_folder}/{new_dash_devname}.dashboard"
         out.writestr(new_dash_path, new_xml_s.encode("utf-8"))
 
@@ -325,21 +473,90 @@ def _repack_dashboard_and_reports_zip(
         })
         out.writestr("package.xml", pkg)
 
+    logger.info(
+        "Prepared deploy package for Dashboard+Reports: dashboard='%s', reports=%d",
+        f"{tgt_folder}/{new_dash_devname}",
+        len(report_fullnames),
+    )
+    logger.info("Rename map entries: %d", len(rename_map))
+    if rename_map:
+        # Log a compact view of the map
+        preview = ", ".join(f"{k} -> {v}" for k, v in list(rename_map.items())[:20])
+        if len(rename_map) > 20:
+            preview += ", ..."
+        logger.info("Report rename preview: %s", preview)
+    logger.info("package.xml contents (Dashboard+Reports):\n%s", pkg)
+
     out_bytes.seek(0)
     return out_bytes
 
 
 def _deploy_zip(zip_bytes: BytesIO) -> None:
     sf = get_salesforce_client()
+    # Inspect and log zip contents and package.xml before deploy
+    try:
+        zip_bytes.seek(0)
+        raw = zip_bytes.read()
+        with zipfile.ZipFile(BytesIO(raw), "r") as zf:
+            names = zf.namelist()
+            logger.info("Deploying zip with %d entries: %s", len(names), ", ".join(names))
+            if "package.xml" in names:
+                pkg_s = zf.read("package.xml").decode("utf-8", errors="replace")
+                logger.info("Deploy package.xml contents before deploy:\n%s", pkg_s)
+                # Skip deploy if package.xml has no <types> members
+                has_members = "<types>" in pkg_s and "<members>" in pkg_s
+                if not has_members:
+                    logger.warning("package.xml has no members; skipping deployment.")
+                    return
+            else:
+                logger.warning("Deploy zip missing package.xml")
+                # Attempt to detect metadata files
+                meta_entries = [n for n in names if n.endswith((".report", ".dashboard"))]
+                if not meta_entries:
+                    logger.warning("No metadata entries detected; skipping deployment.")
+                    return
+    except Exception as exc:
+        logger.warning("Failed to inspect deploy zip: %s", exc)
+        raw = raw if 'raw' in locals() else zip_bytes.getvalue()
+
     with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
-        tmp.write(zip_bytes.read())
+        tmp.write(raw)
         tmp.flush()
         from salesforce_api.models.deploy import Options
 
+        logger.info("Starting metadata deployment (checkOnly=False)...")
         deployment = sf.deploy.deploy(tmp.name, Options(checkOnly=False))
-        deployment.wait()
-        status = deployment.get_status()
-        if getattr(status, "success", True) is False:
+
+        # Poll for status with logging
+        import time
+        max_wait_seconds = 1800
+        poll_interval = 2
+        waited = 0
+        final_status = None
+        while waited <= max_wait_seconds:
+            status = deployment.get_status()
+            state = getattr(status, "status", None) or getattr(status, "State", None)
+            done = getattr(status, "done", None)
+            success = getattr(status, "success", None)
+            logger.info("Deploy status: status=%s done=%s success=%s", state, done, success)
+            if bool(done) or (isinstance(state, str) and state.lower() in ("succeeded", "failed", "canceled", "completed")):
+                final_status = status
+                break
+            time.sleep(poll_interval)
+            waited += poll_interval
+
+        if final_status is None:
+            # Fallback: ensure we have the latest
+            final_status = deployment.get_status()
+
+        # Summarize final status
+        try:
+            detail_dict = getattr(final_status, "__dict__", {})
+            logger.info("Final deploy status summary: %s", detail_dict)
+        except Exception:
+            logger.info("Final deploy status (raw): %s", str(final_status))
+
+        if getattr(final_status, "success", True) is False:
             raise RuntimeError("Deployment failed")
 
 
@@ -404,6 +621,7 @@ def _list_folder_items(folder_id: str, item_type: str) -> List[Dict[str, str]]:
         url = f"{base}/services/data/v{version}/analytics/reports?folderId={folder_id}"
     else:
         url = f"{base}/services/data/v{version}/analytics/dashboards?folderId={folder_id}"
+    logger.info("Listing %s items via Analytics API: %s", item_type, url)
     resp = getattr(sf, "connection").session.get(url)  # type: ignore[attr-defined]
     resp.raise_for_status()
     data = resp.json()
@@ -423,6 +641,7 @@ def _list_folder_items(folder_id: str, item_type: str) -> List[Dict[str, str]]:
             "name": name,
             "developerName": dev,
         })
+    logger.info("Found %d %s item(s) in folder '%s'", len(norm), item_type, folder_id)
     return norm
 
 

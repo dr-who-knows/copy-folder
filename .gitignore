@@ -1,2 +1,4 @@
 venv/*
+.cursor/*
 *.env
+*.pyc

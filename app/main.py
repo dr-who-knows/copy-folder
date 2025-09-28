@@ -1,3 +1,5 @@
+import logging
+import os
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -12,6 +14,12 @@ from .sf import (
     copy_dashboard_with_reports,
 )
 
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
 
 app = FastAPI(title="SF Reports & Dashboards Copier")
 
