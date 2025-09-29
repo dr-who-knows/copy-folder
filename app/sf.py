@@ -73,7 +73,24 @@ def list_dashboard_folders() -> List[Dict[str, str]]:
 
 
 def list_dashboards_in_folder(folder_id: str) -> List[Dict[str, str]]:
-    return _list_folder_items(folder_id, "Dashboard")
+    # Use SOQL to list dashboards by Folder Name
+    _, folder_name = _get_folder_devname_by_id(folder_id)
+    sf = get_salesforce_client()
+    safe_name = folder_name.replace("'", "\\'")
+    soql = (
+        "SELECT Id, DeveloperName, Title FROM Dashboard WHERE FolderName = '"
+        + safe_name
+        + "' ORDER BY Title"
+    )
+    rows = sf.sobjects.query(soql) or []
+    dashboards: List[Dict[str, str]] = []
+    for r in rows:
+        dashboards.append({
+            "Id": r.get("Id", ""),
+            "DeveloperName": r.get("DeveloperName", ""),
+            "Title": r.get("Title", r.get("DeveloperName", "")),
+        })
+    return dashboards
 
 
 def _get_folder_devname_by_id(folder_id: str) -> Tuple[str, str]:
@@ -373,21 +390,22 @@ def _resolve_report_developernames(report_ids: List[str]) -> Dict[str, str]:
 def copy_dashboard_with_reports(
     source_dashboard_folder_id: str,
     source_dashboard_developer_name: str,
-    target_folder_name: str,
+    target_dashboard_folder_name: str,
+    target_report_folder_name: str,
 ) -> None:
     sf = get_salesforce_client()
 
     src_folder_devname, _ = _get_folder_devname_by_id(source_dashboard_folder_id)
-    tgt_folder_devname = _ensure_dashboard_folder_exists(target_folder_name)
-    # Also ensure report folder exists with the same name for copied reports
-    _ensure_report_folder_exists(target_folder_name)
+    tgt_dash_folder_devname = _ensure_dashboard_folder_exists(target_dashboard_folder_name)
+    # Ensure report folder exists for copied reports
+    tgt_report_folder_devname = _ensure_report_folder_exists(target_report_folder_name)
 
     dashboard_fullname = f"{src_folder_devname}/{source_dashboard_developer_name}"
     logger.info(
-        "Starting copy of Dashboard '%s' to target folder '%s' (devname='%s')",
+        "Starting copy of Dashboard '%s' to target folders (dashboard='%s', reports='%s')",
         dashboard_fullname,
-        target_folder_name,
-        tgt_folder_devname,
+        target_dashboard_folder_name,
+        target_report_folder_name,
     )
 
     # Retrieve dashboard first
@@ -422,11 +440,11 @@ def copy_dashboard_with_reports(
         reports_zip.seek(0)
 
     # Prepare existing names in target folders for dedupe
-    tgt_report_folder_id = _get_folder_id_by_devname("Report", tgt_folder_devname)
+    tgt_report_folder_id = _get_folder_id_by_devname("Report", tgt_report_folder_devname)
     existing_reports_items = _list_folder_items(tgt_report_folder_id, "Report")
     report_existing: Set[str] = {r.get("developerName", "") for r in existing_reports_items if r.get("developerName")}
 
-    tgt_dash_folder_id = _get_folder_id_by_devname("Dashboard", tgt_folder_devname)
+    tgt_dash_folder_id = _get_folder_id_by_devname("Dashboard", tgt_dash_folder_devname)
     existing_dash_items = _list_folder_items(tgt_dash_folder_id, "Dashboard")
     dashboard_existing: Set[str] = {d.get("developerName", "") for d in existing_dash_items if d.get("developerName")}
 
@@ -435,7 +453,8 @@ def copy_dashboard_with_reports(
         dash_zip,
         reports_zip,
         src_folder_devname,
-        tgt_folder_devname,
+        tgt_dash_folder_devname,
+        tgt_report_folder_devname,
         source_dashboard_developer_name,
         report_existing,
         dashboard_existing,
@@ -446,7 +465,8 @@ def copy_dashboard_with_reports(
 def prepare_dashboard_copy(
     source_dashboard_folder_id: str,
     source_dashboard_developer_name: str,
-    target_folder_name: str,
+    target_dashboard_folder_name: str,
+    target_report_folder_name: str,
 ) -> Dict[str, object]:
     """Build deployable zip for copying a dashboard (and its reports), but do not deploy.
 
@@ -455,15 +475,15 @@ def prepare_dashboard_copy(
     sf = get_salesforce_client()
 
     src_folder_devname, _ = _get_folder_devname_by_id(source_dashboard_folder_id)
-    tgt_folder_devname = _ensure_dashboard_folder_exists(target_folder_name)
-    _ensure_report_folder_exists(target_folder_name)
+    tgt_dash_folder_devname = _ensure_dashboard_folder_exists(target_dashboard_folder_name)
+    tgt_report_folder_devname = _ensure_report_folder_exists(target_report_folder_name)
 
     dashboard_fullname = f"{src_folder_devname}/{source_dashboard_developer_name}"
     logger.info(
-        "Preparing package for Dashboard '%s' to target folder '%s' (devname='%s')",
+        "Preparing package for Dashboard '%s' to target folders (dashboard='%s', reports='%s')",
         dashboard_fullname,
-        target_folder_name,
-        tgt_folder_devname,
+        target_dashboard_folder_name,
+        target_report_folder_name,
     )
     retr = sf.retrieve.retrieve([SfType("Dashboard", [dashboard_fullname])])
     retr.wait()
@@ -484,11 +504,11 @@ def prepare_dashboard_copy(
             pass
         reports_zip.seek(0)
 
-    tgt_report_folder_id = _get_folder_id_by_devname("Report", tgt_folder_devname)
+    tgt_report_folder_id = _get_folder_id_by_devname("Report", tgt_report_folder_devname)
     existing_reports_items = _list_folder_items(tgt_report_folder_id, "Report")
     report_existing: Set[str] = {r.get("developerName", "") for r in existing_reports_items if r.get("developerName")}
 
-    tgt_dash_folder_id = _get_folder_id_by_devname("Dashboard", tgt_folder_devname)
+    tgt_dash_folder_id = _get_folder_id_by_devname("Dashboard", tgt_dash_folder_devname)
     existing_dash_items = _list_folder_items(tgt_dash_folder_id, "Dashboard")
     dashboard_existing: Set[str] = {d.get("developerName", "") for d in existing_dash_items if d.get("developerName")}
 
@@ -496,7 +516,8 @@ def prepare_dashboard_copy(
         dash_zip,
         reports_zip,
         src_folder_devname,
-        tgt_folder_devname,
+        tgt_dash_folder_devname,
+        tgt_report_folder_devname,
         source_dashboard_developer_name,
         report_existing,
         dashboard_existing,
@@ -507,12 +528,12 @@ def prepare_dashboard_copy(
     package_xml = ""
     with zipfile.ZipFile(deploy_zip, "r") as zf:
         for n in zf.namelist():
-            if n.startswith(f"reports/{tgt_folder_devname}/") and n.endswith(".report"):
+            if n.startswith(f"reports/{tgt_report_folder_devname}/") and n.endswith(".report"):
                 dev = n.split("/")[-1].removesuffix(".report")
-                members_reports.append(f"{tgt_folder_devname}/{dev}")
-            if n.startswith(f"dashboards/{tgt_folder_devname}/") and n.endswith(".dashboard"):
+                members_reports.append(f"{tgt_report_folder_devname}/{dev}")
+            if n.startswith(f"dashboards/{tgt_dash_folder_devname}/") and n.endswith(".dashboard"):
                 dev = n.split("/")[-1].removesuffix(".dashboard")
-                member_dashboard = f"{tgt_folder_devname}/{dev}"
+                member_dashboard = f"{tgt_dash_folder_devname}/{dev}"
         try:
             package_xml = zf.read("package.xml").decode("utf-8", errors="replace")
         except Exception:
@@ -534,7 +555,8 @@ def prepare_dashboard_copy(
         "member_dashboard": member_dashboard,
         "package_xml": package_xml,
         "zip_path": zip_path,
-        "target_folder_devname": tgt_folder_devname,
+        "target_dashboard_devname": tgt_dash_folder_devname,
+        "target_report_devname": tgt_report_folder_devname,
     }
 
 
@@ -674,7 +696,8 @@ def _repack_dashboard_and_reports_zip(
     dash_zip: BytesIO,
     reports_zip: BytesIO,
     src_folder: str,
-    tgt_folder: str,
+    tgt_dash_folder: str,
+    tgt_report_folder: str,
     dashboard_devname: str,
     report_existing: Set[str],
     dashboard_existing: Set[str],
@@ -695,15 +718,15 @@ def _repack_dashboard_and_reports_zip(
             content = rep_src.read(name)
             base_devname = name.split("/")[-1].removesuffix(".report")
             new_devname = _dedupe_developer_name(base_devname, report_existing)
-            new_name = f"reports/{tgt_folder}/{new_devname}.report"
+            new_name = f"reports/{tgt_report_folder}/{new_devname}.report"
             out.writestr(new_name, content)
-            report_fullnames.append(f"{tgt_folder}/{new_devname}")
+            report_fullnames.append(f"{tgt_report_folder}/{new_devname}")
             # Build rename map for any possible original folder
             try:
                 _, original_folder, _ = name.split("/", 2)
             except ValueError:
                 original_folder = src_folder
-            rename_map[f"{original_folder}/{base_devname}"] = f"{tgt_folder}/{new_devname}"
+            rename_map[f"{original_folder}/{base_devname}"] = f"{tgt_report_folder}/{new_devname}"
 
         # dashboard rewritten
         old_dash_path = f"dashboards/{src_folder}/{dashboard_devname}.dashboard"
@@ -711,19 +734,19 @@ def _repack_dashboard_and_reports_zip(
         new_xml_s = _rewrite_dashboard_report_refs(xml_s, rename_map)
         # Always force rename dashboard to ensure copy-not-move semantics
         new_dash_devname = _force_new_developer_name(dashboard_devname, dashboard_existing)
-        new_dash_path = f"dashboards/{tgt_folder}/{new_dash_devname}.dashboard"
+        new_dash_path = f"dashboards/{tgt_dash_folder}/{new_dash_devname}.dashboard"
         out.writestr(new_dash_path, new_xml_s.encode("utf-8"))
 
         # package.xml with both types
         pkg = _render_package_xml({
             "Report": report_fullnames,
-            "Dashboard": [f"{tgt_folder}/{new_dash_devname}"],
+            "Dashboard": [f"{tgt_dash_folder}/{new_dash_devname}"],
         })
         out.writestr("package.xml", pkg)
 
     logger.info(
         "Prepared deploy package for Dashboard+Reports: dashboard='%s', reports=%d",
-        f"{tgt_folder}/{new_dash_devname}",
+        f"{tgt_dash_folder}/{new_dash_devname}",
         len(report_fullnames),
     )
     logger.info("Rename map entries: %d", len(rename_map))
@@ -861,35 +884,41 @@ def _to_devname(label: str) -> str:
 
 
 def _list_folder_items(folder_id: str, item_type: str) -> List[Dict[str, str]]:
-    # Uses Analytics REST API
+    # SOQL-based listing by folder name to avoid Analytics 'recent' behavior
     sf = get_salesforce_client()
-    version = os.getenv("SF_API_VERSION") or "58.0"
-    base = getattr(sf, "connection").instance_url.rstrip('/')  # type: ignore[attr-defined]
+    _, folder_name = _get_folder_devname_by_id(folder_id)
+    safe_name = folder_name.replace("'", "\\'")
     if item_type == "Report":
-        url = f"{base}/services/data/v{version}/analytics/reports?folderId={folder_id}"
+        soql = (
+            "SELECT Id, Name, DeveloperName FROM Report WHERE FolderName = '"
+            + safe_name
+            + "' ORDER BY Name"
+        )
+        rows = sf.sobjects.query(soql) or []
+        out: List[Dict[str, str]] = []
+        for r in rows:
+            out.append({
+                "Id": r.get("Id", ""),
+                "name": r.get("Name", ""),
+                "developerName": r.get("DeveloperName", ""),
+            })
+        logger.info("Found %d Report item(s) in folder '%s' via SOQL", len(out), folder_id)
+        return out
     else:
-        url = f"{base}/services/data/v{version}/analytics/dashboards?folderId={folder_id}"
-    logger.info("Listing %s items via Analytics API: %s", item_type, url)
-    resp = getattr(sf, "connection").session.get(url)  # type: ignore[attr-defined]
-    resp.raise_for_status()
-    data = resp.json()
-    if isinstance(data, list):
-        items = data
-    else:
-        items = (
-            data.get("reports") if item_type == "Report" else data.get("dashboards")
-        ) or data.get("items") or data.get("records") or []
-    # Normalize keys to include developerName when possible
-    norm: List[Dict[str, str]] = []
-    for it in items:
-        name = it.get("name") or it.get("title") or it.get("label") or ""
-        dev = it.get("developerName") or _to_devname(name)
-        norm.append({
-            "Id": it.get("id", ""),
-            "name": name,
-            "developerName": dev,
-        })
-    logger.info("Found %d %s item(s) in folder '%s'", len(norm), item_type, folder_id)
-    return norm
+        soql = (
+            "SELECT Id, DeveloperName, Title FROM Dashboard WHERE FolderName = '"
+            + safe_name
+            + "' ORDER BY Title"
+        )
+        rows = sf.sobjects.query(soql) or []
+        out: List[Dict[str, str]] = []
+        for r in rows:
+            out.append({
+                "Id": r.get("Id", ""),
+                "name": r.get("Title", r.get("DeveloperName", "")),
+                "developerName": r.get("DeveloperName", ""),
+            })
+        logger.info("Found %d Dashboard item(s) in folder '%s' via SOQL", len(out), folder_id)
+        return out
 
 

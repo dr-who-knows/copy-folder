@@ -72,9 +72,18 @@
           </div>
           <div class="mb-3">
             <label class="form-label">Target dashboard folder</label>
-            <select name="target_folder_name" class="form-select" required>
+            <select name="target_dashboard_folder_name" class="form-select" required>
               <option value="" disabled selected>Choose...</option>
               {% for f in dashboard_folders %}
+                <option value="{{ f['Name'] }}">{{ f['Name'] }} ({{ f['DeveloperName'] }})</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Target reports folder</label>
+            <select name="target_report_folder_name" class="form-select" required>
+              <option value="" disabled selected>Choose...</option>
+              {% for f in report_folders %}
                 <option value="{{ f['Name'] }}">{{ f['Name'] }} ({{ f['DeveloperName'] }})</option>
               {% endfor %}
             </select>

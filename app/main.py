@@ -80,12 +80,14 @@ def post_copy_report_folder(source_folder_id: str = Form(...), target_folder_nam
 def post_copy_dashboard(
     dashboard_folder_id: str = Form(...),
     dashboard_developer_name: str = Form(...),
-    target_folder_name: str = Form(...),
+    target_dashboard_folder_name: str = Form(...),
+    target_report_folder_name: str = Form(...),
 ):
     copy_dashboard_with_reports(
         source_dashboard_folder_id=dashboard_folder_id,
         source_dashboard_developer_name=dashboard_developer_name,
-        target_folder_name=target_folder_name,
+        target_dashboard_folder_name=target_dashboard_folder_name,
+        target_report_folder_name=target_report_folder_name,
     )
     return RedirectResponse(url="/", status_code=303)
 
@@ -115,12 +117,14 @@ def prepare_report_folder(request: Request, source_folder_id: str = Form(...), t
 def prepare_dashboard(request: Request,
     dashboard_folder_id: str = Form(...),
     dashboard_developer_name: str = Form(...),
-    target_folder_name: str = Form(...),
+    target_dashboard_folder_name: str = Form(...),
+    target_report_folder_name: str = Form(...),
 ):
     data = prepare_dashboard_copy(
         source_dashboard_folder_id=dashboard_folder_id,
         source_dashboard_developer_name=dashboard_developer_name,
-        target_folder_name=target_folder_name,
+        target_dashboard_folder_name=target_dashboard_folder_name,
+        target_report_folder_name=target_report_folder_name,
     )
     report_folders = list_report_folders()
     dashboard_folders = list_dashboard_folders()
@@ -133,7 +137,8 @@ def prepare_dashboard(request: Request,
             "member_dashboard": data.get("member_dashboard", ""),
             "package_xml": data.get("package_xml", ""),
             "zip_path": data.get("zip_path", ""),
-            "target_folder_devname": data.get("target_folder_devname", ""),
+            "target_dashboard_devname": data.get("target_dashboard_devname", ""),
+            "target_report_devname": data.get("target_report_devname", ""),
             "report_folders": report_folders,
             "dashboard_folders": dashboard_folders,
         },
