@@ -1,7 +1,7 @@
 import logging
 import os
 from fastapi import FastAPI, Request, Form
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -10,9 +10,11 @@ from .sf import (
     list_report_folders,
     list_dashboard_folders,
     list_dashboards_in_folder,
+    list_reports_in_folder,
     copy_report_folder,
     copy_dashboard_with_reports,
     prepare_report_copy,
+    prepare_selected_reports_copy,
     prepare_dashboard_copy,
     start_deploy,
     get_deploy_status,
@@ -70,6 +72,44 @@ def dashboards_by_folder(request: Request, folder_id: str):
     )
 
 
+# JSON API endpoints for browser tables
+@app.get("/api/reports")
+def api_list_reports(folder_id: str):
+    try:
+        items = list_reports_in_folder(folder_id)
+        return JSONResponse(items)
+    except Exception as exc:
+        logging.exception("Failed to list reports for folder %s", folder_id)
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.get("/api/dashboards")
+def api_list_dashboards(folder_id: str):
+    try:
+        items = list_dashboards_in_folder(folder_id)
+        return JSONResponse(items)
+    except Exception as exc:
+        logging.exception("Failed to list dashboards for folder %s", folder_id)
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.get("/api/folders")
+def api_list_folders(kind: str):
+    try:
+        if kind == "report":
+            items = list_report_folders()
+        elif kind == "dashboard":
+            items = list_dashboard_folders()
+        else:
+            return JSONResponse({"error": "invalid_kind"}, status_code=400)
+        # Normalize shape
+        out = [{"Id": f.get("Id"), "Name": f.get("Name"), "DeveloperName": f.get("DeveloperName")} for f in items or []]
+        return JSONResponse(out)
+    except Exception as exc:
+        logging.exception("Failed to list folders for kind %s", kind)
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
 @app.post("/copy/report-folder")
 def post_copy_report_folder(source_folder_id: str = Form(...), target_folder_name: str = Form(...)):
     copy_report_folder(source_folder_id=source_folder_id, target_folder_name=target_folder_name)
@@ -96,6 +136,35 @@ def post_copy_dashboard(
 @app.post("/prepare/report-folder")
 def prepare_report_folder(request: Request, source_folder_id: str = Form(...), target_folder_name: str = Form(...)):
     data = prepare_report_copy(source_folder_id=source_folder_id, target_folder_name=target_folder_name)
+    report_folders = list_report_folders()
+    dashboard_folders = list_dashboard_folders()
+    return templates.TemplateResponse(
+        "review.html",
+        {
+            "request": request,
+            "kind": "report",
+            "members": data.get("members", []),
+            "package_xml": data.get("package_xml", ""),
+            "zip_path": data.get("zip_path", ""),
+            "target_folder_devname": data.get("target_folder_devname", ""),
+            "report_folders": report_folders,
+            "dashboard_folders": dashboard_folders,
+        },
+    )
+
+
+@app.post("/prepare/reports-selected")
+def prepare_reports_selected(
+    request: Request,
+    source_folder_id: str = Form(...),
+    target_folder_name: str = Form(...),
+    report_ids: list[str] = Form(default=[]),
+):
+    data = prepare_selected_reports_copy(
+        source_folder_id=source_folder_id,
+        selected_report_ids=report_ids,
+        target_folder_name=target_folder_name,
+    )
     report_folders = list_report_folders()
     dashboard_folders = list_dashboard_folders()
     return templates.TemplateResponse(

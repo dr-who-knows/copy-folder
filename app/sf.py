@@ -93,6 +93,14 @@ def list_dashboards_in_folder(folder_id: str) -> List[Dict[str, str]]:
     return dashboards
 
 
+def list_reports_in_folder(folder_id: str) -> List[Dict[str, str]]:
+    """Public wrapper to list reports in a given folder by Id.
+
+    Returns items with keys: Id, name, developerName
+    """
+    return _list_folder_items(folder_id, "Report")
+
+
 def _get_folder_devname_by_id(folder_id: str) -> Tuple[str, str]:
     sf = get_salesforce_client()
     soql = f"SELECT Id, Name, DeveloperName FROM Folder WHERE Id = '{folder_id}'"
@@ -347,6 +355,74 @@ def prepare_report_copy(source_folder_id: str, target_folder_name: str) -> Dict[
         tmp.flush()
         zip_path = tmp.name
     logger.info("Prepared zip stored at %s with %d member(s)", zip_path, len(members))
+    return {
+        "members": members,
+        "package_xml": package_xml,
+        "zip_path": zip_path,
+        "target_folder_devname": tgt_folder_devname,
+    }
+
+
+def prepare_selected_reports_copy(
+    source_folder_id: str,
+    selected_report_ids: List[str],
+    target_folder_name: str,
+) -> Dict[str, object]:
+    """Build deployable zip for copying only selected reports from a folder.
+
+    Returns dictionary with: members (List[str]), package_xml (str), zip_path (str), target_folder_devname (str)
+    """
+    sf = get_salesforce_client()
+
+    src_folder_devname, _ = _get_folder_devname_by_id(source_folder_id)
+    tgt_folder_devname = _ensure_report_folder_exists(target_folder_name)
+
+    if not selected_report_ids:
+        return {"members": [], "package_xml": "", "zip_path": "", "target_folder_devname": tgt_folder_devname}
+
+    # Resolve Id -> DeveloperName for selected reports
+    id_to_dev = _resolve_report_developernames(selected_report_ids)
+    fullnames = [f"{src_folder_devname}/{dev}" for dev in id_to_dev.values() if dev]
+    # Deduplicate while preserving order
+    fullnames = list(dict.fromkeys(fullnames))
+    if not fullnames:
+        return {"members": [], "package_xml": "", "zip_path": "", "target_folder_devname": tgt_folder_devname}
+
+    # Retrieve just the selected reports
+    retr = sf.retrieve.retrieve([SfType("Report", fullnames)])
+    retr.wait()
+    source_zip = retr.get_zip_file()
+    raw_zip = source_zip.getvalue()
+
+    # Prepare existing names in the target folder to dedupe
+    tgt_folder_id = _get_folder_id_by_devname("Report", tgt_folder_devname)
+    existing_items = _list_folder_items(tgt_folder_id, "Report")
+    existing: Set[str] = {row.get("developerName", "") for row in existing_items if row.get("developerName")}
+
+    # Build new zip with files moved to target folder
+    new_zip_bytes = _repack_reports_zip(BytesIO(raw_zip), src_folder_devname, tgt_folder_devname, existing, force_rename=True)
+
+    # Inspect prepared zip: members and package.xml
+    members: List[str] = []
+    package_xml = ""
+    with zipfile.ZipFile(new_zip_bytes, "r") as zf:
+        for n in zf.namelist():
+            if n.startswith(f"reports/{tgt_folder_devname}/") and n.endswith(".report"):
+                dev = n.split("/")[-1].removesuffix(".report")
+                members.append(f"{tgt_folder_devname}/{dev}")
+        try:
+            package_xml = zf.read("package.xml").decode("utf-8", errors="replace")
+        except Exception:
+            package_xml = ""
+
+    # Persist zip to temp file
+    new_zip_bytes.seek(0)
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+        tmp.write(new_zip_bytes.read())
+        tmp.flush()
+        zip_path = tmp.name
+
+    logger.info("Prepared selective reports zip stored at %s with %d member(s)", zip_path, len(members))
     return {
         "members": members,
         "package_xml": package_xml,
