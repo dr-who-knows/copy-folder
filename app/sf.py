@@ -62,7 +62,20 @@ def list_report_folders() -> List[Dict[str, str]]:
     sf = get_salesforce_client()
     soql = "SELECT Id, Name, DeveloperName FROM Folder WHERE Type = 'Report' ORDER BY Name"
     res = sf.sobjects.query(soql)
-    return res  # library returns list-like per docs
+    # Filter out folders with null or literal "(null)" names
+    filtered = []
+    for r in res or []:
+        name = r.get("Name")
+        dev = r.get("DeveloperName")
+        if not name:
+            continue
+        if isinstance(name, str) and name.strip().lower() == "(null)":
+            continue
+        # Also skip if DeveloperName is missing (not actionable)
+        if not dev:
+            continue
+        filtered.append(r)
+    return filtered  # library returns list-like per docs
 
 
 def list_dashboard_folders() -> List[Dict[str, str]]:
@@ -793,7 +806,7 @@ def _repack_dashboard_and_reports_zip(
                 continue
             content = rep_src.read(name)
             base_devname = name.split("/")[-1].removesuffix(".report")
-            new_devname = _dedupe_developer_name(base_devname, report_existing)
+            new_devname = _force_new_developer_name(base_devname, report_existing)
             new_name = f"reports/{tgt_report_folder}/{new_devname}.report"
             out.writestr(new_name, content)
             report_fullnames.append(f"{tgt_report_folder}/{new_devname}")
